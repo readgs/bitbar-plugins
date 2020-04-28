@@ -224,7 +224,7 @@ const bitbarHeaders = {
 
 const bitbarItems = {
     configurationError: {
-        text: 'Error in config: '
+        text: 'Error in config file: '
     }
 }
 
@@ -243,17 +243,18 @@ const bitbarActions = {
      * Shows a "Start backup" option and manually starts backup process when selected.
      */
     startBackup: {
-        text: 'Start backup',
+        text: 'Back Up Now',
         //bash: See init()
-        param1: 'start',
+        param1: '--start',
         terminal: false
     },
     /**
      * Shows a "Stop backup" option and manually stops backup process if running, when selected.
      */
     stopBackup: {
-        text: 'Stop backup',
+        text: 'Stop Backup',
         //bash: See init(),
+        param1: '--stop',
         terminal: false
     }
 }
@@ -281,7 +282,7 @@ async function init() {
 
     // Setup any bitbar items with additional info after init
     bitbarActions.startBackup.bash = globals.args['$0'];
-    bitbarActions.stopBackup.bash = `${globals.args['$0']} stop`;
+    bitbarActions.stopBackup.bash = globals.args['$0'];
     bitbarItems.configurationError.text += globals.configurationError;
 
     // Get and store our lastest backup status
@@ -308,18 +309,18 @@ function stopBackup() {
  */
 function defaultOutput() {
     // If lockfile exists, we're running
-    if(global.backupStatus == BackupStatus.Running) {
+    if(globals.backupStatus == BackupStatus.Running) {
         bitbar([
             bitbarHeaders.backupRunning,
             bitbar.separator,
             {
-                text: `Running for ${global.backupDuration} minutes`,
+                text: `Running for ${globals.backupDuration} minutes`,
             },
             bitbarActions.stopBackup
         ]);
     }
     // If error file exists, something is wrong
-    else if(global.backupStatus == BackupStatus.Failed) {
+    else if(globals.backupStatus == BackupStatus.Failed) {
         bitbar([
             bitbarHeaders.backupError,
             bitbar.separator,
@@ -330,7 +331,7 @@ function defaultOutput() {
         ]);
     }
     // If success file exists, the last backup succeeded
-    else if (global.backupStatus == BackupStatus.Succeeded) {
+    else if (globals.backupStatus == BackupStatus.Succeeded) {
         const formattedFileDate = !globals.backupDate ? 'never' : formatDate(globals.backupDate);
         bitbar([
             bitbarHeaders.backupSuccess,
@@ -341,14 +342,14 @@ function defaultOutput() {
             bitbarActions.configure
         ]);
 
-        if(!global.configuration) {
+        if(!globals.configuration) {
             bitbar([bitbarItems.configurationError]);
         }
         else {
-            bitbar([bitBarActions.startBackup]);
+            bitbar([bitbarActions.startBackup]);
         }
     }
-    // Otherwise, something is amiss
+    // Otherwise, we don't have any status (i.e. backup has never been run)
     else {
         bitbar([
             bitbarHeaders.backupNoStatus,
@@ -358,6 +359,9 @@ function defaultOutput() {
 
         if(!globals.configuration) {
             bitbar([bitbarItems.configurationError]);
+        }
+        else {
+            bitbar([bitbarActions.startBackup]);
         }
     }
 }
@@ -440,40 +444,44 @@ function loadConfiguration() {
     try {
         configuration = jsonc.parse(content);
     } catch(e) {
-        console.log('e = ', e);
         globals.configurationError = 'Error parsing configuration file';
         return;
     }
-    console.log(configuration);
+
+    // By default, no error
+    let error = null;
     
     // If rsync path is bad
     if(!configuration.rsyncPath || !fs.existsSync(configuration.rsyncPath)) {
-        globals.configurationError = 'rsyncPath is invalid or file does not exist';
+        error = 'rsyncPath is invalid or file does not exist';
     }
     // If frequency isn't specified, or it's not a valid frequency
     else if(!configuration.frequency || !(configuration.frequency === 'manual' || getFrequencyInMinutes(configuration.frequency))) {
-        globals.configurationError = 'frequency is invalid';
+        error = 'frequency is invalid';
     }
     // Must have a valid source 
     else if(!configuration.source) {
-        globals.configurationError = 'source must be set';
+        error = 'source must be set';
     }
     // Must have a valid destination
     else if(!configuration.destination) {
-        globals.configurationError = 'destination must be set';
+        error = 'destination must be set';
     }
     // Check whether our rsync arguments is a legit string array
     else if(!configuration.rsyncAdditionalArguments
         || !Array.isArray(configuration.rsyncAdditionalArguments)
         || !configuration.rsyncAdditionalArguments.reduce((prev, curr) => typeof prev === 'string' || typeof curr === 'string')) {
-        console.log('rsyncAdditionalArguments = ', configuration.rsyncAdditionalArguments);
-        console.log('rsyncAdditionalArguments.isArray = ', Array.isArray(configuration.rsyncAdditionalArguments));
-        console.log('rsyncAdditionalArguments.reduce() = ', typeof configuration.rsyncAdditionalArguments[0]);
-        globals.configurationError = 'rsyncAdditionalArguments is invalid'
+        error = 'rsyncAdditionalArguments is invalid'
     }
 
-    // Config is good, let's save it as our actual config
-    globals.configuration = configuration;
+    if(error) {
+        // Just save the error that we got
+        globals.configurationError = error;
+    }
+    else {
+        // Config is good, let's save it as our actual config
+        globals.configuration = configuration;
+    }
 }
 
 /**
