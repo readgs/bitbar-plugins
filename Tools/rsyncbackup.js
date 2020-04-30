@@ -17,6 +17,9 @@ const date = require('date-and-time');
 const DateDiff = require('date-diff');
 const mkdirp = require('mkdirp');
 const jsonc = require('jsonc');
+const lockFile = require('lockfile');
+const delay = require('delay');
+const execa = require('execa');
 
 /**
  * Enumeration of valid backup statuses
@@ -25,19 +28,19 @@ const BackupStatus = {
     /**
      * No status available on backup (i.e. it hasn't run ever)
      */
-    None: 0,
+    None: 'None',
     /**
      * Last backup was successful
      */
-    Succeeded: 1,
+    Succeeded: 'Succeeded',
     /**
      * Last backup failed
      */
-    Failed: 2,
+    Failed: 'Failed',
     /**
      * Backup currently in progress
      */
-    Running: 3
+    Running: 'Running'
 }
 
 /**
@@ -72,6 +75,14 @@ const constants = {
      * Name of excludes file for rsync
      */
     EXCLUDESFILE: 'excludes.txt',
+    /**
+     * Name of file where errors are logged
+     */
+    ERRORLOGFILE: 'errorlog.txt',
+    /**
+     * Name of file where rsync output is logged
+     */
+    LOGFILE: 'log.txt',
     /**
      * Default content for the rsync excludes file
      */
@@ -165,6 +176,15 @@ const globals = {
      */
     successFile: getBackupPath(constants.SUCCESSFILE),
     /**
+     * Logs from rsync go here
+     */
+    logFile: getBackupPath(constants.LOGFILE),
+    /**
+     * Any errors that rsync output go here
+     */
+    errorLogFile: getBackupPath(constants.ERRORLOGFILE),
+
+    /**
      * Arguments retrieved from commandline
      */
     args: {},
@@ -191,6 +211,10 @@ const globals = {
      * Number of minutes the backup has been running, or ran (depending on status)
      */
     backupDuration: 0,
+    /**
+     * Arguments to pass to the rsync command
+     */
+    rsyncArgs: []
 }
 
 /**
@@ -279,6 +303,25 @@ async function init() {
 
     // Load in configuration
     loadConfiguration();
+    console.log(globals);
+
+    // Initilize the rsync arguments based on configuration
+    if(globals.configuration) {
+        // Use the source, Luke...
+        let source = untildify(globals.configuration.source);
+        // If destination includes a colon, we'll treat it as a ssh server path.
+        // Otherwise, make sure the tilde gets translated.
+        let destination = globals.configuration.destination.includes(':')
+            ? globals.configuration.destination
+            : untildify(globals.configuration.destination);
+        // Merge additional arguments with our default arguments
+        globals.rsyncArgs = [
+            ...globals.configuration.rsyncAdditionalArguments,
+            `--exclude-from=${globals.excludesFile}`,
+            source,
+            destination
+        ]
+    }
 
     // Setup any bitbar items with additional info after init
     bitbarActions.startBackup.bash = globals.args['$0'];
@@ -292,8 +335,28 @@ async function init() {
 /**
  * Starts the backup process
  */
-function startBackup() {
+async function startBackup() {
     console.log('START BACKUP!');
+    // Ensure we can get a lock on the lockfile before we proceed
+    lockFile.lockSync(globals.lockFile, {});
+    // Indicate that we've started a backup
+    touch(globals.startFile);
+    // Remove the error and success flags since we are just starting
+    untouch(globals.errorFile);
+    untouch(globals.successFile);
+    // Run rsync
+    let exitCode = await executeRsync();
+    if(exitCode != 0) {
+        // Failed!
+        touch(globals.errorFile);
+    }
+    else {
+        // We succeeded!!
+        touch(globals.successFile);
+    }
+    // We're all done, unlock the lock file
+    lockFile.unlockSync(globals.lockFile);
+    console.log('BACKUP ENDED!');
 }
 
 /**
@@ -313,9 +376,8 @@ function defaultOutput() {
         bitbar([
             bitbarHeaders.backupRunning,
             bitbar.separator,
-            {
-                text: `Running for ${globals.backupDuration} minutes`,
-            },
+            { text: `Backup running...` },
+            { text: `Running for ${globals.backupDuration} minutes` },
             bitbarActions.stopBackup
         ]);
     }
@@ -324,9 +386,8 @@ function defaultOutput() {
         bitbar([
             bitbarHeaders.backupError,
             bitbar.separator,
-            {
-                text: `Backup failed!`
-            },
+            { text: `Backup failed!` },
+            { text: `Ran for ${globals.backupDuration} minutes` },
             bitbarActions.configure
         ]);
     }
@@ -336,9 +397,8 @@ function defaultOutput() {
         bitbar([
             bitbarHeaders.backupSuccess,
             bitbar.separator,
-            {
-                text: `Last backup ${formattedFileDate}`
-            },
+            { text: `Last backup ${formattedFileDate}` },
+            { text: `Ran for ${globals.backupDuration} minutes` },
             bitbarActions.configure
         ]);
 
@@ -364,6 +424,24 @@ function defaultOutput() {
             bitbar([bitbarActions.startBackup]);
         }
     }
+}
+
+/**
+ * Run the actual rsync program with the configured arguments
+ */
+async function executeRsync() {
+    // Create our error and output logs
+    const errStream = fs.createWriteStream(globals.errorLogFile);
+    const outStream = fs.createWriteStream(globals.logFile);
+
+    //console.log('rsyncargs = ', globals.rsyncArgs);
+    const subProcess = execa(globals.configuration.rsyncPath, globals.rsyncArgs, {});
+    
+    // We don't want any output from rsync (spit out to our respective files)
+    subProcess.stderr.pipe(errStream);
+    subProcess.stdout.pipe(outStream);
+
+    return (await subProcess).exitCode;
 }
 
 /**
@@ -411,7 +489,7 @@ function getBackupStatus() {
     // If a lockfile exists, then our backup is currently running
     if(fs.existsSync(globals.lockFile)) { 
         // Duration is start of backup to now
-        let durationDateDiff = new DateDiff(now, backupDate);
+        let durationDateDiff = new DateDiff(now, globals.backupDate);
         globals.backupStatus = BackupStatus.Running;
         globals.backupDuration = durationDateDiff.minutes();
     }
@@ -419,7 +497,7 @@ function getBackupStatus() {
     else if(fs.existsSync(globals.errorFile)) {
         // Duration is start of backup to date/time of error file
         let errorFileDate = getFileDate(globals.errorFile);
-        let durationDateDiff = new DateDiff(errorFileDate, backupDate);
+        let durationDateDiff = new DateDiff(errorFileDate, globals.backupDate);
         globals.backupStatus = BackupStatus.Failed;
         globals.backupDuration = durationDateDiff.minutes();
     }
@@ -427,7 +505,7 @@ function getBackupStatus() {
     else if(fs.existsSync(globals.successFile)) {
         // Duration is start of backup to date/time of error file
         let successFileDate = getFileDate(globals.successFile);
-        let durationDateDiff = new DateDiff(successFileDate, backupDate);
+        let durationDateDiff = new DateDiff(successFileDate, globals.backupDate);
         globals.backupStatus = BackupStatus.Succeeded;
         globals.backupDuration = durationDateDiff.minutes();
     }
@@ -519,7 +597,7 @@ function getFrequencyInMinutes(frequency) {
  */
 function getFileDate(filePath) {
     const { mtime } = fs.statSync(filePath);
-    return birthtime;
+    return mtime;
 }
 
 /**
@@ -539,12 +617,30 @@ function getBackupPath(fileName) {
     return untildify(path.join(constants.WORKINGFOLDER, fileName));
 }
 
+/**
+ * Creates an empty file and/or updates the modified date.
+ * @param {string} filePath 
+ */
+function touch(filePath) {
+    fs.closeSync(fs.openSync(filePath, 'w'));
+}
+
+/**
+ * Removes the file if it exists.
+ * @param {string} filePath 
+ */
+function untouch(filePath) {
+    if(fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+    }
+}
+
 // START HERE
 (async () => {
     await init();
 
     if(globals.args.start) {
-        startBackup();
+        await startBackup();
     }
     else if(globals.args.stop) {
         stopBackup();
