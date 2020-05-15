@@ -19,7 +19,7 @@
  *      NOTE: This will only install the required dependencies into the plugins folder.
  *      Specifically, into a subfolder called node_modules.
  * 
- *      From Terminal: npm install --no-package-lock path untildify yargs bitbar date-and-time date-diff mkdirp jsonc lockfile execa
+ *      From Terminal: npm install --no-package-lock path untildify yargs bitbar mkdirp jsonc lockfile execa moment
  * -Refresh your plugins
  * -Select "Configure" option to open config file up in your default editor
  * -Make whatever changes necessary for your backup needs.
@@ -290,6 +290,26 @@ const bitbarActions = {
         terminal: false
     },
     /**
+     * Shows a "View Logs..." option and brings up the last log in a text when selected.
+     */
+    viewLog: {
+        text: 'View Log...',
+        bash: '/usr/bin/open',
+        param1: '-t',
+        param2: globals.logFile,
+        terminal: false
+    },
+    /**
+     * Shows a "View Logs..." option and brings up the last log in a text when selected.
+     */
+    viewErrorLog: {
+        text: 'View Error Log...',
+        bash: '/usr/bin/open',
+        param1: '-t',
+        param2: globals.errorLogFile,
+        terminal: false
+    },
+    /**
      * Shows a "Start backup" option and manually starts backup process when selected.
      */
     startBackup: {
@@ -440,7 +460,9 @@ function defaultOutput() {
             { text: `Ran for ${backupDurationInMinutes} minutes` },
             { text: `Next backup at ${formattedNextBackupDate}` },
             bitbar.separator,
-            bitbarActions.configure
+            bitbarActions.configure,
+            bitbarActions.viewLog,
+            bitbarActions.viewErrorLog,
         ]);
     }
     // If success file exists, the last backup succeeded
@@ -453,7 +475,8 @@ function defaultOutput() {
             { text: `Ran for ${backupDurationInMinutes} minutes` },
             { text: `Next backup at ${formattedNextBackupDate}` },
             bitbar.separator,
-            bitbarActions.configure
+            bitbarActions.configure,
+            bitbarActions.viewLog
         ]);
     }
     // Otherwise, we don't have any status (i.e. backup has never been run)
@@ -473,8 +496,8 @@ function defaultOutput() {
             bitbar([bitbarItems.configurationError]);
         }
         else {
-            bitbar([bitbarActions.startBackup]);
             bitbar([bitbarActions.dryRun]);
+            bitbar([bitbarActions.startBackup]);
         }
     }
 }
