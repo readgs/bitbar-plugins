@@ -5,21 +5,43 @@
 // <bitbar.author>Gregory S. Read</bitbar.author>
 // <bitbar.author.github>readgs</bitbar.author.github>
 // <bitbar.desc>Schedule and monitor rsync backups via BitBar</bitbar.desc>
-// <bitbar.dependencies>node npm/path npm/untildify npm/yargs npm/bitbar npm/date-and-time npm/date-diff npm/mkdirp</bitbar.dependencies>
-// <bitbar.abouturl>http://gregread.com</bitbar.abouturl>
+// <bitbar.dependencies>node npm/path npm/untildify npm/yargs npm/bitbar npm/mkdirp npm/jsonc npm/lockfile npm/execa npm/moment</bitbar.dependencies>
+// <bitbar.abouturl></bitbar.abouturl>
+
+/**
+ * Quick Install
+ * -Make sure Node is installed (this also installs npm)
+ * -Copy script to your bitbar plugins folder.
+ *      NOTE: Be sure to name it something like rsyncbackup.5s.js so that it will refresh
+ *      backup status (and trigger backups) often enough to be useful.
+ * -Open up a terminal and navigate to plugin folder
+ * -Install required npm packages...
+ *      NOTE: This will only install the required dependencies into the plugins folder.
+ *      Specifically, into a subfolder called node_modules.
+ * 
+ *      From Terminal: npm install --no-package-lock path untildify yargs bitbar date-and-time date-diff mkdirp jsonc lockfile execa
+ * -Refresh your plugins
+ * -Select "Configure" option to open config file up in your default editor
+ * -Make whatever changes necessary for your backup needs.
+ *      NOTE: It is recommended that you don't set a schedule for your backup until
+ *      you execute a "dry run" to make sure you like what it's backing up.
+ * -Select "Dry Run"
+ * -If you like the results, select Back Up Now
+ * -If you still like the results, update the schedule in the configuration.
+ * -Enjoy.
+ */
+
 
 const path = require('path');
 const untildify = require('untildify');
 const yargs = require('yargs');
 const bitbar = require('bitbar');
 const fs = require('fs');
-const date = require('date-and-time');
-const DateDiff = require('date-diff');
 const mkdirp = require('mkdirp');
 const jsonc = require('jsonc');
 const lockFile = require('lockfile');
-const delay = require('delay');
 const execa = require('execa');
+const moment = require('moment');
 
 /**
  * Enumeration of valid backup statuses
@@ -87,7 +109,8 @@ const constants = {
      * Default content for the rsync excludes file
      */
     DEFAULTEXCLUDES: 
-`.Trash/
+`.backup/
+.Trash/
 .DS_Store`,
     /**
      * Default configuration content to use if no config file exists.
@@ -183,7 +206,6 @@ const globals = {
      * Any errors that rsync output go here
      */
     errorLogFile: getBackupPath(constants.ERRORLOGFILE),
-
     /**
      * Arguments retrieved from commandline
      */
@@ -208,9 +230,13 @@ const globals = {
      */
     backupDate: null,
     /**
-     * Number of minutes the backup has been running, or ran (depending on status)
+     * Number of milliseconds the backup has been running, or ran (depending on status)
      */
     backupDuration: 0,
+    /**
+     * Date and time of the next scheduled backup
+     */
+    nextScheduledBackup: null,
     /**
      * Arguments to pass to the rsync command
      */
@@ -258,7 +284,7 @@ const bitbarActions = {
      */
     configure: {
         text: 'Configure...',
-        bash: 'open',
+        bash: '/usr/bin/open',
         param1: '-t',
         param2: globals.configFile,
         terminal: false
@@ -280,6 +306,17 @@ const bitbarActions = {
         //bash: See init(),
         param1: '--stop',
         terminal: false
+    },
+    /**
+     * Starts a backup, but not actually doing the copy.  Will run in a terminal as well
+     * so user can observe what will be copied, etc.
+     */
+    dryRun: {
+        text: 'Dry Run...',
+        //bash: See init()
+        param1: '--start',
+        param2: '--dry-run',
+        terminal: true
     }
 }
 
@@ -294,6 +331,7 @@ async function init() {
         .default('stop', false)
         .describe('start', 'Starts the backup')
         .describe('stop', 'Stops the backup')
+        .describe('dry-run', 'If starting backup, runs it in --dry-run rsync mode with a terminal')
         .argv;
 
     // Create missing items as needed
@@ -303,7 +341,6 @@ async function init() {
 
     // Load in configuration
     loadConfiguration();
-    console.log(globals);
 
     // Initilize the rsync arguments based on configuration
     if(globals.configuration) {
@@ -320,23 +357,30 @@ async function init() {
             `--exclude-from=${globals.excludesFile}`,
             source,
             destination
-        ]
+        ];
+        // Enable dry-run mode if requested
+        if(globals.args.dryRun) {
+            globals.rsyncArgs.push('--dry-run');
+        }
     }
 
     // Setup any bitbar items with additional info after init
-    bitbarActions.startBackup.bash = globals.args['$0'];
-    bitbarActions.stopBackup.bash = globals.args['$0'];
+    bitbarActions.startBackup.bash = __filename;
+    bitbarActions.stopBackup.bash = __filename;
+    bitbarActions.dryRun.bash = __filename;
     bitbarItems.configurationError.text += globals.configurationError;
 
     // Get and store our lastest backup status
     getBackupStatus();
+
+    // Figure out when our next backup should occur, if applicable
+    getNextScheduledBackup();
 }
 
 /**
  * Starts the backup process
  */
 async function startBackup() {
-    console.log('START BACKUP!');
     // Ensure we can get a lock on the lockfile before we proceed
     lockFile.lockSync(globals.lockFile, {});
     // Indicate that we've started a backup
@@ -356,7 +400,6 @@ async function startBackup() {
     }
     // We're all done, unlock the lock file
     lockFile.unlockSync(globals.lockFile);
-    console.log('BACKUP ENDED!');
 }
 
 /**
@@ -371,13 +414,19 @@ function stopBackup() {
  * arguments are passed to the script.
  */
 function defaultOutput() {
+    const formattedFileDate = !globals.backupDate ? 'never' : formatDate(globals.backupDate);
+    const formattedNextBackupDate = !globals.nextScheduledBackup ? 'never' : formatDate(globals.nextScheduledBackup);
+    const backupDurationInMinutes = (globals.backupDuration / 60000).toFixed(2);
+
     // If lockfile exists, we're running
     if(globals.backupStatus == BackupStatus.Running) {
         bitbar([
             bitbarHeaders.backupRunning,
             bitbar.separator,
             { text: `Backup running...` },
-            { text: `Running for ${globals.backupDuration} minutes` },
+            { text: `Started at ${formattedFileDate}` },
+            { text: `Running for ${backupDurationInMinutes}` },
+            bitbar.separator,
             bitbarActions.stopBackup
         ]);
     }
@@ -387,41 +436,45 @@ function defaultOutput() {
             bitbarHeaders.backupError,
             bitbar.separator,
             { text: `Backup failed!` },
-            { text: `Ran for ${globals.backupDuration} minutes` },
+            { text: `Started at ${formattedFileDate}` },
+            { text: `Ran for ${backupDurationInMinutes} minutes` },
+            { text: `Next backup at ${formattedNextBackupDate}` },
+            bitbar.separator,
             bitbarActions.configure
         ]);
     }
     // If success file exists, the last backup succeeded
     else if (globals.backupStatus == BackupStatus.Succeeded) {
-        const formattedFileDate = !globals.backupDate ? 'never' : formatDate(globals.backupDate);
         bitbar([
             bitbarHeaders.backupSuccess,
             bitbar.separator,
-            { text: `Last backup ${formattedFileDate}` },
-            { text: `Ran for ${globals.backupDuration} minutes` },
+            { text: `Backup succeeded!` },
+            { text: `Started at ${formattedFileDate}` },
+            { text: `Ran for ${backupDurationInMinutes} minutes` },
+            { text: `Next backup at ${formattedNextBackupDate}` },
+            bitbar.separator,
             bitbarActions.configure
         ]);
-
-        if(!globals.configuration) {
-            bitbar([bitbarItems.configurationError]);
-        }
-        else {
-            bitbar([bitbarActions.startBackup]);
-        }
     }
     // Otherwise, we don't have any status (i.e. backup has never been run)
     else {
         bitbar([
             bitbarHeaders.backupNoStatus,
             bitbar.separator,
+            { text: `Next backup at ${formattedNextBackupDate} minutes` },
+            bitbar.separator,
             bitbarActions.configure
         ]);        
+    }
 
+    // Always show run/configuration error if we're in any status other that running
+    if (globals.backupStatus != BackupStatus.Running) {
         if(!globals.configuration) {
             bitbar([bitbarItems.configurationError]);
         }
         else {
             bitbar([bitbarActions.startBackup]);
+            bitbar([bitbarActions.dryRun]);
         }
     }
 }
@@ -430,16 +483,22 @@ function defaultOutput() {
  * Run the actual rsync program with the configured arguments
  */
 async function executeRsync() {
-    // Create our error and output logs
-    const errStream = fs.createWriteStream(globals.errorLogFile);
-    const outStream = fs.createWriteStream(globals.logFile);
-
-    //console.log('rsyncargs = ', globals.rsyncArgs);
     const subProcess = execa(globals.configuration.rsyncPath, globals.rsyncArgs, {});
-    
-    // We don't want any output from rsync (spit out to our respective files)
-    subProcess.stderr.pipe(errStream);
-    subProcess.stdout.pipe(outStream);
+
+    // If not dry run, send output to log files.  Otherwise output will just
+    // go to terminal.
+    if(!globals.args.dryRun) {
+        // Create our error and output logs
+        const errStream = fs.createWriteStream(globals.errorLogFile);
+        const outStream = fs.createWriteStream(globals.logFile);
+        // We don't want any output from rsync (spit out to our respective files)
+        subProcess.stderr.pipe(errStream);
+        subProcess.stdout.pipe(outStream);
+    } else {
+        // We're interactive dry run, send output to parent process
+        subProcess.stderr.pipe(process.stderr);
+        subProcess.stdout.pipe(process.stdout);
+    }
 
     return (await subProcess).exitCode;
 }
@@ -466,10 +525,53 @@ function createFileIfNeeded(filePath, defaultContent) {
 }
 
 /**
+ * Sets the date/time of when the next backup should take place
+ * based on the configuration and status.
+ */
+function getNextScheduledBackup() {
+    let now = new Date();
+    let frequencyInMinutes = getFrequencyInMinutes(globals.configuration.frequency);
+
+    // If we haven't done a backup before, schedule it for now!
+    if(!globals.backupDate) {
+        globals.nextScheduledBackup = now;
+    }
+    // If there's no frequency, assume it's manual
+    else if(!frequencyInMinutes) {
+        globals.nextScheduledBackup = null;
+    }
+    else {
+        // Get the date/time for the next scheduled backup
+        globals.nextScheduledBackup = moment(globals.backupDate).add(frequencyInMinutes, 'minutes').toDate();
+        // If next scheduled backup is in the past, set it to happen now
+        if(globals.nextScheduledBackup.getTime() < now.getTime()) {
+            globals.nextScheduledBackup = now;
+        }
+    }
+}
+
+
+
+/**
  * Starts an instance of the backup if we are scheduled to do so
+ * @returns {boolean} True if backup started, otherwise false.
  */
 function startBackupIfScheduled() {
+    let now = new Date();
+    // If the time has come!
+    if(globals.nextScheduledBackup && globals.nextScheduledBackup.getTime() <= now) {
+        // Execute ourselves with the "--start" parameter so we start the backup
+        // but don't wait for the process to finish.
+        const subProcess = execa(__filename, ['--start'], {
+            detached: true,
+            cleanup: false
+        });
 
+        subProcess.unref();
+        return true;
+    }
+
+    return false;
 }
 
 /**
@@ -489,25 +591,22 @@ function getBackupStatus() {
     // If a lockfile exists, then our backup is currently running
     if(fs.existsSync(globals.lockFile)) { 
         // Duration is start of backup to now
-        let durationDateDiff = new DateDiff(now, globals.backupDate);
         globals.backupStatus = BackupStatus.Running;
-        globals.backupDuration = durationDateDiff.minutes();
+        globals.backupDuration = moment(now).diff(globals.backupDate);
     }
     // Else if error file exists, our last backup failed
     else if(fs.existsSync(globals.errorFile)) {
         // Duration is start of backup to date/time of error file
         let errorFileDate = getFileDate(globals.errorFile);
-        let durationDateDiff = new DateDiff(errorFileDate, globals.backupDate);
         globals.backupStatus = BackupStatus.Failed;
-        globals.backupDuration = durationDateDiff.minutes();
+        globals.backupDuration = moment(errorFileDate).diff(globals.backupDate);
     }
     // Else if success file exists, our last backup succeeded
     else if(fs.existsSync(globals.successFile)) {
         // Duration is start of backup to date/time of error file
         let successFileDate = getFileDate(globals.successFile);
-        let durationDateDiff = new DateDiff(successFileDate, globals.backupDate);
         globals.backupStatus = BackupStatus.Succeeded;
-        globals.backupDuration = durationDateDiff.minutes();
+        globals.backupDuration = moment(successFileDate).diff(globals.backupDate);
     }
 
     // Else, we're in an unknown state (don't set any status)
@@ -605,8 +704,7 @@ function getFileDate(filePath) {
  * @param {Date} fileDate 
  */
 function formatDate(fileDate) {
-    const pattern = date.compile('M/D/YY h:mm A');
-    return date.format(new Date(fileDate), pattern);
+    return moment(fileDate).format('M/D/YY h:mm A');
 }
 
 /**
@@ -646,7 +744,13 @@ function untouch(filePath) {
         stopBackup();
     }
     else {
-        startBackupIfScheduled();
+        let isBackupStarted = startBackupIfScheduled();
         defaultOutput();
+        if(isBackupStarted) {
+            // If we started a backup, we want to kill our process.  Otherwise
+            // it will wait for the other backup process that we started, which
+            // we don't want (so status gets reported back right away).
+            process.exit(0);
+        }
     }
 })();
